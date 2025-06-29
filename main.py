@@ -6,6 +6,7 @@ import json
 import traceback
 from pathlib import Path
 from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 import aiofiles
 import aiohttp
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
@@ -14,10 +15,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
-
 # Global variables
 job_manager = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global job_manager
+    job_manager = JobManager()
+    asyncio.create_task(job_manager.process_queue())
+    yield
+    # Shutdown
+    if job_manager:
+        job_manager.running = False
+
+app = FastAPI(lifespan=lifespan)
 
 # Configuration
 MAX_CONCURRENT_JOBS = 5
@@ -63,6 +75,23 @@ class JobManager:
         output_path = job['output_path']
         
         try:
+            # Check if files need to be downloaded
+            if not image_path.exists():
+                jobs[job_id]['status'] = 'downloading_image'
+                jobs[job_id]['progress'] = 0
+                if not await download_file(job['image_url'], image_path):
+                    jobs[job_id]['status'] = 'failed'
+                    jobs[job_id]['error'] = 'Failed to download image'
+                    return
+            
+            if not video_path.exists():
+                jobs[job_id]['status'] = 'downloading_video'
+                jobs[job_id]['progress'] = 0
+                if not await download_file(job['video_url'], video_path):
+                    jobs[job_id]['status'] = 'failed' 
+                    jobs[job_id]['error'] = 'Failed to download video'
+                    return
+            
             jobs[job_id]['status'] = 'processing'
             jobs[job_id]['progress'] = 0
             
@@ -147,23 +176,33 @@ class JobManager:
 
 job_manager = JobManager()
 
-@app.on_event("startup")
-async def startup_event():
-    global job_manager
-    job_manager = JobManager()
-    asyncio.create_task(job_manager.process_queue())
+
 
 async def download_file(url: str, file_path: Path) -> bool:
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as response:
                 if response.status == 200:
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    
                     async with aiofiles.open(file_path, 'wb') as f:
                         async for chunk in response.content.iter_chunked(8192):
                             await f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # Update download progress if we know total size
+                            if total_size > 0:
+                                progress = int((downloaded / total_size) * 100)
+                                # Find job_id from file_path to update progress
+                                job_id = file_path.stem.split('_')[0]
+                                if job_id in jobs:
+                                    jobs[job_id]['progress'] = min(progress, 95)  # Keep some room for processing
                     return True
                 return False
-    except:
+    except Exception as e:
+        print(f"Download error: {str(e)}")
         return False
 
 @app.post("/process")
@@ -211,11 +250,7 @@ async def process_video(
             ext = '.png' if '.png' in image_url.lower() else '.jpg'
             image_path = image_path.with_suffix(ext)
             jobs[job_id]['image_path'] = image_path
-            
-            if not await download_file(image_url, image_path):
-                jobs[job_id]['status'] = 'failed'
-                jobs[job_id]['error'] = 'Failed to download image'
-                raise HTTPException(status_code=400, detail="Failed to download image")
+            jobs[job_id]['image_url'] = image_url  # Store URL for later download
         
         # Handle video
         if video:
@@ -230,11 +265,7 @@ async def process_video(
             ext = '.mkv' if '.mkv' in video_url.lower() else '.mp4'
             video_path = video_path.with_suffix(ext)
             jobs[job_id]['video_path'] = video_path
-            
-            if not await download_file(video_url, video_path):
-                jobs[job_id]['status'] = 'failed'
-                jobs[job_id]['error'] = 'Failed to download video'
-                raise HTTPException(status_code=400, detail="Failed to download video")
+            jobs[job_id]['video_url'] = video_url  # Store URL for later download
         
         jobs[job_id]['status'] = 'queued'
         await job_queue.put(job_id)
@@ -266,11 +297,20 @@ async def get_progress(job_id: str):
         "progress": job['progress']
     }
     
-    if job['status'] == 'completed':
+    if job['status'] == 'downloading_image':
+        response['message'] = 'Downloading image...'
+    elif job['status'] == 'downloading_video':
+        response['message'] = 'Downloading video...'
+    elif job['status'] == 'processing':
+        response['message'] = 'Processing video with FFmpeg...'
+    elif job['status'] == 'completed':
+        response['message'] = 'Processing complete'
         response['download_url'] = job.get('download_url')
     elif job['status'] == 'failed':
+        response['message'] = 'Processing failed'
         response['error'] = job.get('error')
     elif job['status'] == 'queued':
+        response['message'] = f'Queued (position: {await get_queue_position(job_id)})'
         response['queue_position'] = await get_queue_position(job_id)
         response['active_jobs'] = active_jobs
     
