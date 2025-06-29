@@ -3,6 +3,7 @@ import uuid
 import asyncio
 import subprocess
 import json
+import traceback
 from pathlib import Path
 from typing import Optional, Dict, Any
 import aiofiles
@@ -14,6 +15,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
+
+# Global variables
+job_manager = None
 
 # Configuration
 MAX_CONCURRENT_JOBS = 5
@@ -145,6 +149,8 @@ job_manager = JobManager()
 
 @app.on_event("startup")
 async def startup_event():
+    global job_manager
+    job_manager = JobManager()
     asyncio.create_task(job_manager.process_queue())
 
 async def download_file(url: str, file_path: Path) -> bool:
@@ -168,30 +174,33 @@ async def process_video(
     image_url: Optional[str] = Form(None),
     video_url: Optional[str] = Form(None)
 ):
-    if not ((image or image_url) and (video or video_url)):
-        raise HTTPException(status_code=400, detail="Provide either files or URLs for both image and video")
-    
-    job_id = str(uuid.uuid4())
-    image_path = UPLOAD_DIR / f"{job_id}_image"
-    video_path = UPLOAD_DIR / f"{job_id}_video"
-    output_path = OUTPUT_DIR / f"{job_id}_output.mp4"
-    
-    jobs[job_id] = {
-        'status': 'uploading',
-        'progress': 0,
-        'image_path': image_path,
-        'video_path': video_path,
-        'output_path': output_path,
-        'created_at': asyncio.get_event_loop().time()
-    }
-    
     try:
+        if not ((image or image_url) and (video or video_url)):
+            raise HTTPException(status_code=400, detail="Provide either files or URLs for both image and video")
+        
+        job_id = str(uuid.uuid4())
+        image_path = UPLOAD_DIR / f"{job_id}_image"
+        video_path = UPLOAD_DIR / f"{job_id}_video"
+        output_path = OUTPUT_DIR / f"{job_id}_output.mp4"
+        
+        jobs[job_id] = {
+            'status': 'uploading',
+            'progress': 0,
+            'image_path': image_path,
+            'video_path': video_path,
+            'output_path': output_path,
+            'created_at': asyncio.get_event_loop().time()
+        }
+        
         # Handle image
         if image:
-            if image.content_type not in ['image/jpeg', 'image/jpg', 'image/png']:
-                raise HTTPException(status_code=400, detail="Image must be JPEG or PNG")
+            if not image.content_type or not any(x in image.content_type for x in ['image/jpeg', 'image/jpg', 'image/png']):
+                # Try to determine from filename
+                if not image.filename or not any(image.filename.lower().endswith(x) for x in ['.jpg', '.jpeg', '.png']):
+                    raise HTTPException(status_code=400, detail="Image must be JPEG or PNG")
             
-            ext = '.jpg' if 'jpeg' in image.content_type or 'jpg' in image.content_type else '.png'
+            ext = '.png' if (image.filename and image.filename.lower().endswith('.png')) else '.jpg'
+            
             image_path = image_path.with_suffix(ext)
             jobs[job_id]['image_path'] = image_path
             
@@ -199,7 +208,7 @@ async def process_video(
                 content = await image.read()
                 await f.write(content)
         else:
-            ext = '.jpg' if any(x in image_url.lower() for x in ['.jpg', '.jpeg']) else '.png'
+            ext = '.png' if '.png' in image_url.lower() else '.jpg'
             image_path = image_path.with_suffix(ext)
             jobs[job_id]['image_path'] = image_path
             
@@ -210,10 +219,7 @@ async def process_video(
         
         # Handle video
         if video:
-            if not video.content_type.startswith('video/'):
-                raise HTTPException(status_code=400, detail="Invalid video format")
-            
-            ext = '.mp4' if 'mp4' in video.content_type else '.mkv'
+            ext = '.mkv' if (video.filename and '.mkv' in video.filename.lower()) else '.mp4'
             video_path = video_path.with_suffix(ext)
             jobs[job_id]['video_path'] = video_path
             
@@ -238,10 +244,15 @@ async def process_video(
             "progress_url": f"{os.getenv('API_URL', 'http://localhost:8000')}/progress/{job_id}"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = str(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in process_video: {str(e)}")
+        print(traceback.format_exc())
+        if 'job_id' in locals():
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = str(e)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/progress/{job_id}")
 async def get_progress(job_id: str):
