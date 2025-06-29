@@ -13,5 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Remove the EXPOSE line - Railway doesn't need it
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1"]
