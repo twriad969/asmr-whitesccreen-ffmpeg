@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 import aiofiles
 import aiohttp
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 
@@ -47,6 +47,10 @@ active_jobs = 0
 job_queue = asyncio.Queue()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
+def get_base_url(request: Request) -> str:
+    """Get the base URL from the request"""
+    return f"{request.url.scheme}://{request.url.netloc}"
+
 class JobManager:
     def __init__(self):
         self.running = True
@@ -54,21 +58,22 @@ class JobManager:
     async def process_queue(self):
         while self.running:
             try:
-                job_id = await asyncio.wait_for(job_queue.get(), timeout=1.0)
-                asyncio.create_task(self.process_job(job_id))
+                job_data = await asyncio.wait_for(job_queue.get(), timeout=1.0)
+                job_id, base_url = job_data
+                asyncio.create_task(self.process_job(job_id, base_url))
             except asyncio.TimeoutError:
                 continue
     
-    async def process_job(self, job_id: str):
+    async def process_job(self, job_id: str, base_url: str):
         global active_jobs
         async with semaphore:
             active_jobs += 1
             try:
-                await self.run_ffmpeg(job_id)
+                await self.run_ffmpeg(job_id, base_url)
             finally:
                 active_jobs -= 1
     
-    async def run_ffmpeg(self, job_id: str):
+    async def run_ffmpeg(self, job_id: str, base_url: str):
         job = jobs[job_id]
         image_path = job['image_path']
         video_path = job['video_path']
@@ -139,7 +144,7 @@ class JobManager:
             if process.returncode == 0:
                 jobs[job_id]['status'] = 'completed'
                 jobs[job_id]['progress'] = 100
-                jobs[job_id]['download_url'] = f"{os.getenv('API_URL', 'http://localhost:8000')}/download/{job_id}"
+                jobs[job_id]['download_url'] = f"{base_url}/download/{job_id}"
             else:
                 stderr = await process.stderr.read()
                 jobs[job_id]['status'] = 'failed'
@@ -174,10 +179,6 @@ class JobManager:
         except:
             return 0
 
-job_manager = JobManager()
-
-
-
 async def download_file(url: str, file_path: Path) -> bool:
     try:
         timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
@@ -207,7 +208,7 @@ async def download_file(url: str, file_path: Path) -> bool:
 
 @app.post("/process")
 async def process_video(
-    background_tasks: BackgroundTasks,
+    request: Request,
     image: Optional[UploadFile] = File(None),
     video: Optional[UploadFile] = File(None),
     image_url: Optional[str] = Form(None),
@@ -217,6 +218,7 @@ async def process_video(
         if not ((image or image_url) and (video or video_url)):
             raise HTTPException(status_code=400, detail="Provide either files or URLs for both image and video")
         
+        base_url = get_base_url(request)
         job_id = str(uuid.uuid4())
         image_path = UPLOAD_DIR / f"{job_id}_image"
         video_path = UPLOAD_DIR / f"{job_id}_video"
@@ -268,11 +270,11 @@ async def process_video(
             jobs[job_id]['video_url'] = video_url  # Store URL for later download
         
         jobs[job_id]['status'] = 'queued'
-        await job_queue.put(job_id)
+        await job_queue.put((job_id, base_url))
         
         return {
             "job_id": job_id,
-            "progress_url": f"{os.getenv('API_URL', 'http://localhost:8000')}/progress/{job_id}"
+            "progress_url": f"{base_url}/progress/{job_id}"
         }
         
     except HTTPException:
@@ -342,3 +344,11 @@ async def download_file_endpoint(job_id: str):
         filename=f"processed_{job_id}.mp4",
         media_type="video/mp4"
     )
+
+@app.get("/")
+async def root():
+    return {"message": "Video Processing API", "status": "running"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "active_jobs": active_jobs}
